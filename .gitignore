@@ -1,3 +1,5 @@
 .venv/
 chrome_profile_*/
 __pycache__/
+*.npy
+*.json
