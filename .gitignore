@@ -1,0 +1,3 @@
+.venv/
+chrome_profile_*/
+__pycache__/
