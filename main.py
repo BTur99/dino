@@ -1,3 +1,4 @@
+# main.py
 import os
 import random
 import asyncio
@@ -8,6 +9,7 @@ from playwright.async_api import async_playwright
 import config
 import core
 import trainer
+from logger_setup import logger  # ИМПОРТ ЛОГГЕРА
 
 def get_screen_size():
     try:
@@ -35,7 +37,7 @@ async def main():
     
     cleanup_old_profiles(config.NUM_WORKERS)
     
-    print(f"Запускаем {config.NUM_WORKERS} окон друг на друге...")
+    logger.info(f"Запускаем {config.NUM_WORKERS} окон друг на друге...")
     core.load_all()
 
     screen_w, screen_h = get_screen_size()
@@ -68,6 +70,10 @@ async def main():
                         "--test-type",
                         "--no-sandbox",
                         "--mute-audio",
+                        "--disable-session-crashed-bubble",
+                        "--hide-crash-restore-bubble",
+                        "--no-first-run",
+                        "--no-default-browser-check",
                     ],
                 )
                 contexts.append(context)
@@ -94,7 +100,7 @@ async def main():
             if config.TRAIN_MODE:
                 await core.save_all()
 
-    print("\nОБУЧЕНИЕ ЗАВЕРШЕНО (или прервано пользователем)!")
+    logger.info("\nОБУЧЕНИЕ ЗАВЕРШЕНО (или прервано пользователем)!")
 
 if __name__ == "__main__":
     asyncio.run(main())

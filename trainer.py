@@ -1,40 +1,41 @@
+# trainer.py
 import asyncio
 import config
 import core
 import game_env
+from logger_setup import logger
 
 async def worker(worker_id, agent_name, context, stop_event):
     try:
         page = context.pages[0] if context.pages else await context.new_page()
         page.on("close", lambda: stop_event.set())
         
-        # 1. Меняем заголовок вкладки браузера (без эмодзи)
+        # 1. Меняем заголовок вкладки браузера
         await page.add_init_script(f"document.title = '{agent_name}';")
         
         # 2. Загружаем игру
         await page.goto(config.GAME_URL, wait_until="networkidle")
         await asyncio.sleep(1.0)
         
-        # 3. Рисуем имя ПРЯМО ВНУТРИ ИГРЫ (по центру, чуть ниже верха)
+        # 3. Рисуем имя по центру игры
         await page.evaluate(f"""
             () => {{
                 const div = document.createElement('div');
                 div.innerText = '{agent_name}';
                 div.style.position = 'absolute';
-                div.style.top = '100px';                     // Чуть ниже верха
-                div.style.left = '50%';                      // Центр по горизонтали
-                div.style.transform = 'translateX(-50%)';    // Точный центр
-                div.style.fontSize = '40px';                 // Размер текста
+                div.style.top = '100px';
+                div.style.left = '50%';
+                div.style.transform = 'translateX(-50%)';
+                div.style.fontSize = '40px';
                 div.style.fontWeight = 'bold';
-                div.style.color = 'rgba(0, 0, 0, 0.15)';     // Полупрозрачный серый
+                div.style.color = 'rgba(0, 0, 0, 0.15)';
                 div.style.fontFamily = 'Arial, sans-serif';
-                div.style.pointerEvents = 'none';            // Текст не мешает кликам
+                div.style.pointerEvents = 'none';
                 div.style.zIndex = '9999';
                 document.body.appendChild(div);
             }}
         """)
         
-        # 4. Кликаем для фокуса
         await page.bring_to_front()
         await page.mouse.click(config.WIN_W // 2, config.WIN_H // 2)
         await asyncio.sleep(0.5)
@@ -44,34 +45,17 @@ async def worker(worker_id, agent_name, context, stop_event):
             ep_num = core.episodes_done
             current_eps = core.epsilon if config.TRAIN_MODE else 0.0
 
-            state, info, jumping, dist, status = await game_env.start_game(page)
+            # Получаем стартовое состояние
+            state, info, jumping, ttc, speed, status = await game_env.start_game(page)
             
             if stop_event.is_set():
                 break
 
             if state is None:
-                print(f"[{agent_name}] Игра не запустилась ({status}). Перезагрузка...")
+                logger.warning(f"[{agent_name}] Игра не запустилась ({status}). Перезагрузка...")
                 await page.reload(wait_until="networkidle")
                 await asyncio.sleep(1.0)
                 await page.mouse.click(config.WIN_W // 2, config.WIN_H // 2)
-                # После перезагрузки возвращаем надпись
-                await page.evaluate(f"""
-                    () => {{
-                        const div = document.createElement('div');
-                        div.innerText = '{agent_name}';
-                        div.style.position = 'absolute';
-                        div.style.top = '100px';
-                        div.style.left = '50%';
-                        div.style.transform = 'translateX(-50%)';
-                        div.style.fontSize = '40px';
-                        div.style.fontWeight = 'bold';
-                        div.style.color = 'rgba(0, 0, 0, 0.15)';
-                        div.style.fontFamily = 'Arial, sans-serif';
-                        div.style.pointerEvents = 'none';
-                        div.style.zIndex = '9999';
-                        document.body.appendChild(div);
-                    }}
-                """)
                 continue
 
             total_reward = 0.0
@@ -82,49 +66,51 @@ async def worker(worker_id, agent_name, context, stop_event):
                 if stop_event.is_set():
                     break
                     
-                if jumping:
-                    await asyncio.sleep(config.STEP_DELAY)
-                    next_state, info, jumping, dist, status = await game_env.get_state(page)
-
-                    if next_state is None:
-                        if status == "DEAD":
-                            if config.TRAIN_MODE and last_decision is not None:
-                                prev_state, prev_action = last_decision
-                                core.update_q_table(prev_state, prev_action, -100.0, None)
-                            total_reward -= 100.0
-                        print(f"[{agent_name} | Игра {ep_num}] Смерть в прыжке ({status}). Шагов: {step} | Награда: {total_reward:.1f}")
-                        break
-
-                    state = next_state
-                    continue
-
+                # --- ДЕЙСТВИЕ (теперь доступно и в воздухе) ---
                 action = core.choose_action(state, current_eps)
                 last_decision = (state, action)
-                current_dist = dist
+                current_ttc = ttc
+                current_speed = speed 
 
                 if action == config.JUMP:
-                    await page.keyboard.up("ArrowDown")
-                    await page.keyboard.press("Space")
+                    if not jumping:
+                        await page.keyboard.press("Space")
                 elif action == config.DUCK:
+                    # Присед работает и на земле, и в воздухе (быстрое падение)
                     await page.keyboard.down("ArrowDown")
                 else:
                     await page.keyboard.up("ArrowDown")
 
                 await asyncio.sleep(config.STEP_DELAY)
-                next_state, info, jumping, dist, status = await game_env.get_state(page)
+                next_state, info, jumping, ttc, speed, status = await game_env.get_state(page)
 
+                # --- СИСТЕМА НАГРАД (ИСПРАВЛЕНА) ---
                 if next_state is None:
                     reward = -100.0 if status == "DEAD" else 0.0
                 else:
-                    if action == 1 and current_dist >= 500:
-                        reward = -50.0  
-                    elif action == 1 and current_dist > 180:
-                        reward = -2.0   
-                    elif action == 0:
-                        reward = 1.0    
+                    if jumping:
+                        # === ДИНОЗАВР В ВОЗДУХЕ ===
+                        if action == 2: 
+                            reward = config.DUCK_REWARD # +0.1 за быстрое падение
+                        else:
+                            reward = 0.0 # Просто летит — не получает ничего!
                     else:
-                        reward = 0.5    
+                        # === ДИНОЗАВР НА ЗЕМЛЕ ===
+                        if action == 1: # Прыжок
+                            if current_ttc >= 20.0:
+                                reward = -50.0  # Прыжок в пустоту
+                            elif current_ttc > 15.0:
+                                reward = -2.0   # Слишком ранний прыжок
+                            else:
+                                reward = 0.5    # Прыжок по делу
+                        elif action == 0: # Бег
+                            reward = 1.0 + (current_speed / 20.0)
+                            if current_speed > config.HIGH_SPEED_THRESHOLD:
+                                reward += config.HIGH_SPEED_BONUS
+                        else: # Присед на земле
+                            reward = config.DUCK_REWARD
 
+                # --- ОБНОВЛЕНИЕ ЗНАНИЙ ---
                 if config.TRAIN_MODE:
                     core.update_q_table(state, action, reward, next_state)
                     core.epsilon = max(config.EPSILON_MIN, core.epsilon * config.EPSILON_DECAY_STEP)
@@ -132,41 +118,26 @@ async def worker(worker_id, agent_name, context, stop_event):
                 total_reward += reward
                 state = next_state
 
+                # Если умерли — выходим из цикла шагов
                 if next_state is None:
-                    print(f"[{agent_name} | Игра {ep_num}] Конец ({status}). Шагов: {step} | Награда: {total_reward:.1f}")
+                    logger.debug(f"[{agent_name} | Игра {ep_num}] Конец ({status}). Шагов: {step} | Награда: {total_reward:.1f}")
                     break
 
+            # Перезапуск игры, если агент пережил лимит шагов
             if step == config.MAX_STEPS and not stop_event.is_set():
-                print(f"[{agent_name} | Игра {ep_num}] ЛИМИТ ШАГОВ ДОСТИГНУТ ({config.MAX_STEPS}). Перезапуск игры.")
+                logger.info(f"[{agent_name} | Игра {ep_num}] ЛИМИТ ШАГОВ ДОСТИГНУТ ({config.MAX_STEPS}). Перезапуск игры.")
                 await page.reload(wait_until="networkidle")
                 await asyncio.sleep(1.0)
                 await page.mouse.click(config.WIN_W // 2, config.WIN_H // 2)
-                # Возвращаем надпись после перезапуска
-                await page.evaluate(f"""
-                    () => {{
-                        const div = document.createElement('div');
-                        div.innerText = '{agent_name}';
-                        div.style.position = 'absolute';
-                        div.style.top = '100px';
-                        div.style.left = '50%';
-                        div.style.transform = 'translateX(-50%)';
-                        div.style.fontSize = '40px';
-                        div.style.fontWeight = 'bold';
-                        div.style.color = 'rgba(0, 0, 0, 0.15)';
-                        div.style.fontFamily = 'Arial, sans-serif';
-                        div.style.pointerEvents = 'none';
-                        div.style.zIndex = '9999';
-                        document.body.appendChild(div);
-                    }}
-                """)
 
+            # --- ОБНОВЛЕНИЕ СТАТИСТИКИ ---
             stats = core.agent_stats[agent_name]
             stats["episodes_played"] += 1
             stats["total_reward"] += total_reward
             
             if step > stats["max_score"]:
                 stats["max_score"] = step
-                print(f"🏆 [{agent_name}] НОВЫЙ РЕКОРД: {step} очков!")
+                logger.warning(f"[{agent_name}] НОВЫЙ РЕКОРД: {step} очков!")
                 
             if step < stats["min_score"]:
                 stats["min_score"] = step
@@ -183,11 +154,14 @@ async def worker(worker_id, agent_name, context, stop_event):
                 except Exception:
                     pass
 
+            # --- ЗАТУХАНИЕ АЛГОРИТМА И СОХРАНЕНИЕ ---
             if config.TRAIN_MODE and not stop_event.is_set():
+                core.current_alpha = max(config.ALPHA_MIN, core.current_alpha * config.ALPHA_DECAY)
+                
                 if ep_num % 10 == 0:
                     await core.save_all()
 
     except Exception as error:
         if not stop_event.is_set():
-            print(f"[{agent_name}] Окно закрыто или произошла ошибка: {error}")
+            logger.error(f"[{agent_name}] Окно закрыто или произошла ошибка: {error}")
         stop_event.set()

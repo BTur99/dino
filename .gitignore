@@ -3,3 +3,4 @@ chrome_profile_*/
 __pycache__/
 *.npy
 *.json
+inspect_agent.py
