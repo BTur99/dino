@@ -4,3 +4,4 @@ __pycache__/
 *.npy
 *.json
 inspect_agent.py
+gamecode/
