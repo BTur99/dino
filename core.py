@@ -3,79 +3,113 @@ import os
 import json
 import random
 import asyncio
-import copy
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from collections import deque
 import config
-from logger_setup import logger  # ИМПОРТ ЛОГГЕРА
+from logger_setup import logger
 
-q_table = {}
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Используемое устройство: {device}")
+
+class DinoNet(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(DinoNet, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, output_dim)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+# ВХОДНЫЕ ДАННЫЕ ТЕПЕРЬ 5 (без dino_y)
+policy_net = DinoNet(5, len(config.ACTIONS)).to(device)
+target_net = DinoNet(5, len(config.ACTIONS)).to(device)
+target_net.load_state_dict(policy_net.state_dict())
+target_net.eval()
+
+optimizer = optim.Adam(policy_net.parameters(), lr=config.LR)
+memory = deque(maxlen=config.MEMORY_SIZE)
+
 episodes_done = 0
 epsilon = config.EPSILON_START
-current_alpha = config.ALPHA 
 agent_stats = {}
 
 for name in config.AGENT_NAMES:
     agent_stats[name] = {
-        "max_score": 0,
-        "min_score": 99999,
-        "total_reward": 0.0,
-        "episodes_played": 0,
-        "last_100_scores": [],
-        "avg_last_100": 0.0
+        "max_score": 0, "min_score": 99999, "total_reward": 0.0,
+        "episodes_played": 0, "last_100_scores": [], "avg_last_100": 0.0
     }
 
 save_lock = asyncio.Lock()
-
-if not os.path.exists("stats"):
-    os.makedirs("stats")
-
-def get_q_values(state):
-    if state not in q_table:
-        q_table[state] = [0.0] * len(config.ACTIONS)
-    return q_table[state]
+if not os.path.exists("stats"): os.makedirs("stats")
 
 def _write_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 def load_all():
-    global q_table, episodes_done, epsilon, current_alpha
+    global episodes_done, epsilon
     if config.LOAD_MODEL and os.path.exists(config.MODEL_FILE):
-        q_table = np.load(config.MODEL_FILE, allow_pickle=True).item()
-        logger.info(f"Загружена Q-таблица ({len(q_table)} состояний).")
+        policy_net.load_state_dict(torch.load(config.MODEL_FILE, map_location=device))
+        target_net.load_state_dict(policy_net.state_dict())
+        logger.info(f"Загружены веса нейросети.")
     else:
-        logger.info("Q-таблица создана с нуля.")
+        logger.info("Нейросеть создана с нуля.")
     
     if config.LOAD_MODEL and os.path.exists(config.STATE_FILE):
         with open(config.STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         episodes_done = int(data.get("episodes_done", 0))
         epsilon = float(data.get("epsilon", config.EPSILON_START))
-        current_alpha = float(data.get("current_alpha", config.ALPHA))
-        logger.info(f"Загружено состояние: эпизодов {episodes_done}, eps: {epsilon:.4f}, alpha: {current_alpha:.4f}")
+        logger.info(f"Загружено: эпизодов {episodes_done}, eps: {epsilon:.4f}")
 
 async def save_all():
     async with save_lock:
-        if not config.SAVE_MODEL:
-            return
-        await asyncio.to_thread(np.save, config.MODEL_FILE, q_table)
-        state_data = {"episodes_done": episodes_done, "epsilon": epsilon, "current_alpha": current_alpha}
+        if not config.SAVE_MODEL: return
+        await asyncio.to_thread(torch.save, policy_net.state_dict(), config.MODEL_FILE)
+        state_data = {"episodes_done": episodes_done, "epsilon": epsilon}
         await asyncio.to_thread(_write_json, config.STATE_FILE, state_data)
         
-        stats_copy = copy.deepcopy(agent_stats)
+        stats_copy = {k: v.copy() for k, v in agent_stats.items()}
         for name, stats in stats_copy.items():
             await asyncio.to_thread(_write_json, f"stats/stats_{name}.json", stats)
-            
-        logger.info(f"[Сохранение] эпизодов: {episodes_done} | eps: {epsilon:.4f} | alpha: {current_alpha:.4f}")
+        logger.info(f"[Сохранение] эпизодов: {episodes_done} | eps: {epsilon:.4f}")
 
 def choose_action(state, current_epsilon):
-    values = get_q_values(state)
     if config.TRAIN_MODE and random.random() < current_epsilon:
         return random.choice(config.ACTIONS)
-    return int(np.argmax(values))
+    
+    with torch.no_grad():
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+        q_values = policy_net(state_tensor)
+        return int(q_values.argmax().item())
 
-def update_q_table(state, action, reward, next_state):
-    values = get_q_values(state)
-    current_q = values[action]
-    max_next_q = 0.0 if next_state is None else max(get_q_values(next_state))
-    values[action] = current_q + current_alpha * (reward + config.GAMMA * max_next_q - current_q)
+def optimize_model():
+    if len(memory) < config.BATCH_SIZE: return
+    
+    batch = random.sample(memory, config.BATCH_SIZE)
+    state_batch, action_batch, reward_batch, next_state_batch, done_batch = zip(*batch)
+    
+    state_batch = torch.FloatTensor(np.array(state_batch)).to(device)
+    action_batch = torch.LongTensor(action_batch).unsqueeze(1).to(device)
+    reward_batch = torch.FloatTensor(reward_batch).unsqueeze(1).to(device)
+    next_state_batch = torch.FloatTensor(np.array(next_state_batch)).to(device)
+    done_batch = torch.FloatTensor(done_batch).unsqueeze(1).to(device)
+
+    q_values = policy_net(state_batch).gather(1, action_batch)
+    next_q_values = target_net(next_state_batch).max(1)[0].unsqueeze(1)
+    expected_q_values = reward_batch + (config.GAMMA * next_q_values * (1 - done_batch))
+
+    loss = F.mse_loss(q_values, expected_q_values)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+def update_target_network():
+    target_net.load_state_dict(policy_net.state_dict())

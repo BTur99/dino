@@ -16,6 +16,7 @@ def load_data():
     stats_dir = "stats"
     data = []
     
+    # Загружаем статистику агентов из папки stats
     for filepath in glob.glob(os.path.join(stats_dir, "stats_*.json")):
         try:
             with open(filepath, "r", encoding="utf-8") as f:
@@ -26,6 +27,7 @@ def load_data():
         except Exception:
             pass
             
+    # Загружаем глобальное состояние (эпизоды, eps)
     global_state = {}
     if os.path.exists("state_v2.json"):
         try:
@@ -48,22 +50,22 @@ while True:
             
             episodes = global_state.get("episodes_done", 0)
             eps = global_state.get("epsilon", 0)
-            alpha = global_state.get("current_alpha", 0)
             
             col1.metric("Сыграно эпизодов", episodes)
             col2.metric("Epsilon (Любопытство)", f"{eps:.4f}")
-            col3.metric("Alpha (Скорость обучения)", f"{alpha:.4f}")
             
             if data:
+                # Ищем абсолютного чемпиона по рекорду
                 champ = max(data, key=lambda x: x.get("max_score", 0))
-                col4.metric("Абсолютный чемпион", champ['name'], f"Рекорд: {champ['max_score']} очков")
+                col3.metric("Абсолютный чемпион", champ['name'], f"Рекорд: {champ['max_score']} очков")
             else:
-                col4.metric("Абсолютный чемпион", "Нет данных")
+                col3.metric("Абсолютный чемпион", "Нет данных")
             
             st.divider()
 
             # --- ОСНОВНЫЕ ГРАФИКИ ---
             if data:
+                # Сортируем по среднему результату за 100 игр
                 df = pd.DataFrame(data)
                 df = df.sort_values(by="avg_last_100", ascending=False)
                 
@@ -82,8 +84,7 @@ while True:
                     for _, row in top_3.iterrows():
                         history = row.get("last_100_scores", [])
                         if history:
-                            # ИСПРАВЛЕНИЕ ОШИБКИ: Выравниваем длину массивов
-                            # Если у агента меньше 100 игр, дополняем начало пустотами (None)
+                            # Выравниваем длину массивов для pandas
                             if len(history) < 100:
                                 padding = [None] * (100 - len(history))
                                 history_dict[row['name']] = padding + history

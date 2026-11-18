@@ -29,7 +29,7 @@ async def get_state(page):
                     return {
                         status: "OK", distance: 1000, speed: runner.currentSpeed,
                         yPos: 100, jumping: dino.jumping, isBird: false, width: 20, 
-                        secondDist: 1000, dinoY: dino.yPos // ДОБАВЛЕНО dinoY
+                        secondDist: 1000
                     };
                 }
 
@@ -38,8 +38,7 @@ async def get_state(page):
                     yPos: best.yPos, jumping: dino.jumping,
                     isBird: best.type === "PTERODACTYL" || best.isBird === true,
                     width: best.width,
-                    secondDist: second ? second.dist : 1000,
-                    dinoY: dino.yPos // ДОБАВЛЕНО dinoY
+                    secondDist: second ? second.dist : 1000
                 };
             }
             """
@@ -56,22 +55,21 @@ async def get_state(page):
         jumping = result["jumping"]
         is_bird = result.get("isBird", False)
         width = result.get("width", 20)
-        dino_y = result.get("dinoY", 0)
         
         safe_speed = max(speed, 1.0)
         ttc = distance / safe_speed
 
-        if distance >= 500: dist_bin = 5
-        elif ttc > 15.0: dist_bin = 0
-        elif ttc > 10.0: dist_bin = 1
-        elif ttc > 7.0: dist_bin = 2
-        elif ttc > 5.0: dist_bin = 3
-        else: dist_bin = 4
+        # Корзины TTC (в кадрах)
+        if distance >= 500: dist_bin = 4
+        elif ttc > 40: dist_bin = 0       # Слишком рано
+        elif ttc > 25: dist_bin = 1       # Средне
+        elif ttc > 15: dist_bin = 2       # Близко (идеально)
+        else: dist_bin = 3                # Поздно
 
         second_ttc = second_dist / safe_speed
-        if second_ttc > 15.0: second_bin = 0
-        elif second_ttc > 10.0: second_bin = 1
-        elif second_ttc > 6.0: second_bin = 2
+        if second_ttc > 45: second_bin = 0
+        elif second_ttc > 25: second_bin = 1
+        elif second_ttc > 15: second_bin = 2
         else: second_bin = 3
 
         if y_pos < 60: height_bin = 2  
@@ -81,18 +79,8 @@ async def get_state(page):
         bird_bin = 1 if is_bird else 0
         width_bin = 1 if width > 35 else 0
 
-        # НОВОЕ: Определяем высоту самого динозавра
-        if dino_y == 0:
-            dino_height_bin = 0 # На земле
-        elif dino_y < 40:
-            dino_height_bin = 1 # Низко (только что прыгнул или быстро падает)
-        else:
-            dino_height_bin = 2 # Высоко в воздухе
-
-        # Состояние теперь состоит из 6 цифр!
-        state = (dist_bin, height_bin, bird_bin, width_bin, second_bin, dino_height_bin)
-        
-        # Возвращаем speed для награды
+        # 5 ПАРАМЕТРОВ (убрали dino_y)
+        state = (dist_bin, height_bin, bird_bin, width_bin, second_bin)
         return state, "OK", jumping, ttc, speed, "OK"
 
     except Exception as error:
@@ -101,13 +89,10 @@ async def get_state(page):
 async def start_game(page):
     await page.keyboard.up("ArrowDown")
     await asyncio.sleep(0.85)
-
     for _ in range(5):
         await page.keyboard.press("Space")
         await asyncio.sleep(0.15)
-
         state, info, jumping, ttc, speed, status = await get_state(page)
         if state is not None:
             return state, info, jumping, ttc, speed, status
-
     return None, info, False, 0, 0, status
