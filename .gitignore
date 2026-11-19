@@ -3,5 +3,9 @@ chrome_profile_*/
 __pycache__/
 *.npy
 *.json
+*.pth
+*.tmp
+app.log
+stats/
 inspect_agent.py
 gamecode/
