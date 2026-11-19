@@ -14,8 +14,8 @@ BATCH_SIZE = 128
 MEMORY_SIZE = 250000
 TARGET_UPDATE = 1000          # обновление target-сети раз в N ШАГОВ (не эпизодов!)
 EPSILON_START = 1.0
-EPSILON_MIN = 0.02
-EPSILON_DECAY_STEP = 0.99999
+EPSILON_MIN = 0.1
+EPSILON_DECAY_STEP = 1.0
 
 OPTIMIZE_EVERY = 4            # вызывать optimize_model() раз в N шагов (не каждый шаг)
 LOG_LOSS_EVERY = 200          # логировать loss раз в N шагов
