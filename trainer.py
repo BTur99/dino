@@ -73,6 +73,13 @@ async def apply_action(page, action, current_jumping):
 async def _play_episode(page, worker_id, agent_name, stop_event):
     core.episodes_done += 1
     ep_num = core.episodes_done
+    if config.TRAIN_MODE:
+        # Линейное затухание epsilon по эпизодам (не по шагам), один раз в начале эпизода.
+        progress = core.episodes_done / config.EPSILON_DECAY_EPISODES
+        core.epsilon = max(
+            config.EPSILON_MIN,
+            config.EPSILON_START - (config.EPSILON_START - config.EPSILON_MIN) * progress,
+        )
     current_eps = core.epsilon if config.TRAIN_MODE else 0.0
 
     obs = await game_env.start_game(page)

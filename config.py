@@ -14,8 +14,16 @@ BATCH_SIZE = 128
 MEMORY_SIZE = 250000
 TARGET_UPDATE = 1000          # обновление target-сети раз в N ШАГОВ (не эпизодов!)
 EPSILON_START = 1.0
-EPSILON_MIN = 0.1
-EPSILON_DECAY_STEP = 1.0
+EPSILON_MIN = 0.05
+# Линейное затухание epsilon по ЭПИЗОДАМ (не по шагам): на 0 эпизоде eps=1.0,
+# на EPSILON_DECAY_EPISODES эпизоде eps=EPSILON_MIN и дальше держится на минимуме.
+EPSILON_DECAY_EPISODES = 3000
+
+# --- ПРИОРИТЕТНЫЙ REPLAY (PER) ---
+PER_ALPHA = 0.6               # степень приоритета p = (|td| + eps)^alpha
+PER_BETA_START = 0.4          # начальный коэффициент importance sampling
+PER_BETA_STEPS = 100000       # за сколько optimize-шагов beta растёт до 1.0
+PER_EPS = 1e-6                # защита от нулевого приоритета
 
 OPTIMIZE_EVERY = 4            # вызывать optimize_model() раз в N шагов (не каждый шаг)
 LOG_LOSS_EVERY = 200          # логировать loss раз в N шагов
@@ -46,8 +54,8 @@ AGENT_NAMES = [
 ACTIONS = [0, 1, 2]
 NOOP, JUMP, DUCK = 0, 1, 2
 
-# Размерность состояния (5 корзин: дистанция, высота, птица, ширина, второе препятствие)
-STATE_DIM = 5
+# Размерность состояния (8 непрерывных нормализованных признаков, см. game_env.get_state)
+STATE_DIM = 8
 
 # --- СИСТЕМА НАГРАД ---
 REWARD_ALIVE = 0.005         # базовый поток наград за выживание

@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from collections import deque
 import config
 from logger_setup import logger
 
@@ -26,14 +25,108 @@ logger.info(f"Используемое устройство: {device}")
 class DinoNet(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(DinoNet, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 64)
-        self.fc2 = nn.Linear(64, 64)
-        self.fc3 = nn.Linear(64, output_dim)
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, output_dim)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         return self.fc3(x)
+
+
+class SumTree:
+    """Бинарное дерево сумм приоритетов: листья на [capacity-1 .. 2*capacity-2],
+    корень — сумма всех приоритетов. Сэмплинг и обновление за O(log n)."""
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity - 1, dtype=np.float64)
+        self.data = [None] * capacity
+        self.write = 0          # позиция следующей записи (кольцевой буфер)
+        self.n_entries = 0
+
+    def _propagate(self, idx, change):
+        parent = (idx - 1) // 2
+        self.tree[parent] += change
+        if parent != 0:
+            self._propagate(parent, change)
+
+    def update(self, idx, priority):
+        change = priority - self.tree[idx]
+        self.tree[idx] = priority
+        self._propagate(idx, change)
+
+    def add(self, priority, data):
+        idx = self.write + self.capacity - 1
+        self.data[self.write] = data
+        self.update(idx, priority)
+        self.write = (self.write + 1) % self.capacity
+        self.n_entries = min(self.n_entries + 1, self.capacity)
+
+    def _retrieve(self, idx, value):
+        left = 2 * idx + 1
+        if left >= len(self.tree):
+            return idx
+        right = left + 1
+        if value <= self.tree[left]:
+            return self._retrieve(left, value)
+        return self._retrieve(right, value - self.tree[left])
+
+    def get(self, value):
+        """Возвращает (индекс листа, приоритет, переход) для случайного значения value."""
+        idx = self._retrieve(0, value)
+        data_idx = idx - self.capacity + 1
+        return idx, self.tree[idx], self.data[data_idx]
+
+    @property
+    def total(self):
+        return self.tree[0]
+
+
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha, beta_start, beta_steps, eps):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.beta = beta_start
+        self.beta_increment = (1.0 - beta_start) / max(beta_steps, 1)
+        self.eps = eps
+        self.tree = SumTree(capacity)
+        self.max_priority = 1.0
+
+    def __len__(self):
+        return self.tree.n_entries
+
+    def push(self, transition):
+        # Новые переходы получают максимальный приоритет, чтобы гарантированно
+        # быть сэмплированными хотя бы раз.
+        self.tree.add(self.max_priority, transition)
+
+    def sample(self, batch_size):
+        n = len(self)
+        self.beta = min(1.0, self.beta + self.beta_increment)
+
+        indices = []
+        transitions = []
+        weights = []
+        segment = self.tree.total / batch_size
+        for i in range(batch_size):
+            value = random.uniform(segment * i, segment * (i + 1))
+            idx, priority, transition = self.tree.get(value)
+            indices.append(idx)
+            transitions.append(transition)
+            prob = priority / self.tree.total
+            weights.append((n * prob) ** (-self.beta))
+
+        weights = np.array(weights, dtype=np.float32)
+        weights /= weights.max()  # нормализуем к max, чтобы не менять масштаб градиентов
+        return indices, transitions, weights
+
+    def update_priorities(self, indices, td_errors):
+        for idx, td in zip(indices, td_errors):
+            priority = (abs(td) + self.eps) ** self.alpha
+            self.max_priority = max(self.max_priority, priority)
+            self.tree.update(idx, priority)
 
 
 policy_net = DinoNet(config.STATE_DIM, len(config.ACTIONS)).to(device)
@@ -42,7 +135,17 @@ target_net.load_state_dict(policy_net.state_dict())
 target_net.eval()
 
 optimizer = optim.Adam(policy_net.parameters(), lr=config.LR)
-memory = deque(maxlen=config.MEMORY_SIZE)
+logger.info(
+    f"Сеть: вход {config.STATE_DIM} признаков → 128 → 128 → "
+    f"{len(config.ACTIONS)} действий (PER, MEMORY_SIZE={config.MEMORY_SIZE})"
+)
+memory = PrioritizedReplayBuffer(
+    config.MEMORY_SIZE,
+    alpha=config.PER_ALPHA,
+    beta_start=config.PER_BETA_START,
+    beta_steps=config.PER_BETA_STEPS,
+    eps=config.PER_EPS,
+)
 
 episodes_done = 0
 steps_done = 0
@@ -183,7 +286,7 @@ def optimize_model():
     if len(memory) < config.BATCH_SIZE:
         return None
 
-    batch = random.sample(memory, config.BATCH_SIZE)
+    indices, batch, weights = memory.sample(config.BATCH_SIZE)
     state_batch, action_batch, reward_batch, next_state_batch, done_batch = zip(*batch)
 
     state_batch = torch.FloatTensor(np.array(state_batch, dtype=np.float32)).to(device)
@@ -191,6 +294,7 @@ def optimize_model():
     reward_batch = torch.FloatTensor(reward_batch).unsqueeze(1).to(device)
     next_state_batch = torch.FloatTensor(np.array(next_state_batch, dtype=np.float32)).to(device)
     done_batch = torch.FloatTensor(done_batch).unsqueeze(1).to(device)
+    weights = torch.FloatTensor(weights).unsqueeze(1).to(device)
 
     # NaN/Inf в батче убьёт веса навсегда — пропускаем такой батч.
     if not (torch.isfinite(state_batch).all()
@@ -206,7 +310,9 @@ def optimize_model():
         next_q_values = target_net(next_state_batch).gather(1, next_actions)
         expected_q_values = reward_batch + config.GAMMA * next_q_values * (1.0 - done_batch)
 
-    loss = F.smooth_l1_loss(q_values, expected_q_values)
+    # PER: TD-ошибки нужны для обновления приоритетов, а IS-веса — для несмещённой оценки.
+    td_errors = (q_values - expected_q_values).detach()
+    loss = (weights * F.smooth_l1_loss(q_values, expected_q_values, reduction="none")).mean()
 
     # Проверяем ДО обратного прохода: NaN/Inf в loss (а значит и в градиентах)
     # не должен успевать уйти в веса через optimizer.step().
@@ -218,14 +324,17 @@ def optimize_model():
     torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 10.0)
     optimizer.step()
 
+    memory.update_priorities(indices, td_errors.cpu().numpy().squeeze(1))
+
     return float(loss.detach().cpu().item())
 
 
 def record_transition(state, action, reward, next_state, done):
-    """Общая точка записи перехода: счётчик шагов, оптимизация по расписанию,
-    затухание epsilon и обновление target-сети по счётчику шагов."""
-    global steps_done, epsilon
-    memory.append((state, action, reward, next_state, done))
+    """Общая точка записи перехода: счётчик шагов, оптимизация по расписанию
+    и обновление target-сети по счётчику шагов. Epsilon обновляется в trainer.py
+    один раз в начале эпизода (линейно по эпизодам)."""
+    global steps_done
+    memory.push((state, action, reward, next_state, done))
     steps_done += 1
 
     if steps_done % config.OPTIMIZE_EVERY == 0:
@@ -235,8 +344,6 @@ def record_transition(state, action, reward, next_state, done):
                 f"[шаг {steps_done}] loss={loss:.5f} | eps={epsilon:.4f} | "
                 f"эпизодов={episodes_done}"
             )
-
-    epsilon = max(config.EPSILON_MIN, epsilon * config.EPSILON_DECAY_STEP)
 
     if steps_done % config.TARGET_UPDATE == 0 and steps_done > 0:
         update_target_network()
